@@ -79,6 +79,24 @@ stutters, switch to **Starter** for always-on, full-CPU streaming.
 For a Docker-based deploy instead (e.g. self-hosting), use the included
 `Dockerfile` — the server falls back to `ffmpeg`/`yt-dlp` on `PATH`.
 
+## YouTube bot-check (cookies)
+
+From a cloud/datacenter IP, YouTube often refuses `yt-dlp` with *"Sign in to
+confirm you're not a bot."* The fix is to authenticate with cookies:
+
+1. With a **throwaway** Google account (not a personal one — datacenter scraping
+   can get it flagged), open an **Incognito** window and log into YouTube.
+2. Export cookies for `youtube.com` in **Netscape format** (e.g. the
+   "Get cookies.txt LOCALLY" browser extension), then **close the Incognito
+   window without logging out** so the session stays valid.
+3. On Render: service → **Environment → Secret Files → Add Secret File**,
+   filename **`cookies.txt`**, paste the exported contents. It mounts at
+   `/etc/secrets/cookies.txt`, which the relay picks up automatically (the
+   startup log then shows `cookies: loaded`). Never commit cookies to the repo.
+
+Cookies expire and can be invalidated over time; re-export and update the secret
+file if the stream starts failing again. Set `YTDLP_COOKIES` to override the path.
+
 ## Caveats
 
 - This relies on `yt-dlp`, which plays cat-and-mouse with YouTube and breaks

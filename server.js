@@ -15,6 +15,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -26,6 +27,20 @@ const FFMPEG = process.env.FFMPEG_PATH || tryRequire('ffmpeg-static') || 'ffmpeg
 const LOCAL_YTDLP = path.join(__dirname, 'bin', 'yt-dlp');
 const YTDLP = process.env.YTDLP_PATH
   || (fs.existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp');
+
+// Optional YouTube cookies to get past datacenter-IP bot checks ("Sign in to
+// confirm you're not a bot"). On Render, upload the Netscape-format cookies as a
+// Secret File named cookies.txt — it mounts read-only at /etc/secrets/cookies.txt.
+// We copy it to a writable temp path so yt-dlp can refresh the jar in place.
+// No file present -> we just run without cookies.
+const COOKIES_SRC = process.env.YTDLP_COOKIES || '/etc/secrets/cookies.txt';
+let COOKIES = null;
+try {
+  if (fs.existsSync(COOKIES_SRC)) {
+    COOKIES = path.join(os.tmpdir(), 'yt-cookies.txt');
+    fs.copyFileSync(COOKIES_SRC, COOKIES);
+  }
+} catch (e) { console.error('cookies setup failed:', e.message); }
 
 const PORT = parseInt(process.env.PORT, 10) || 10000;
 const STREAM_URL = process.env.STREAM_URL || 'https://www.youtube.com/@LofiGirl/live';
@@ -72,13 +87,15 @@ function log(...a) { console.log(new Date().toISOString(), ...a); }
 // Resolve the current live audio URL with yt-dlp (-g prints the direct media URL).
 function resolveAudioUrl() {
   return new Promise((resolve, reject) => {
-    const yt = spawn(YTDLP, [
+    const args = [
       '-g',                    // print resolved media URL(s) instead of downloading
       '-f', 'bestaudio/best',  // prefer audio-only; fall back to best (we drop video below)
       '--no-warnings',
       '--no-playlist',
-      STREAM_URL,
-    ]);
+    ];
+    if (COOKIES) args.push('--cookies', COOKIES);
+    args.push(STREAM_URL);
+    const yt = spawn(YTDLP, args);
     let out = '', err = '';
     yt.stdout.on('data', (d) => (out += d));
     yt.stderr.on('data', (d) => (err += d));
@@ -229,7 +246,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   log(`relay listening on :${PORT}, source ${STREAM_URL}`);
-  log('binaries -> ffmpeg:', FFMPEG, '| yt-dlp:', YTDLP);
+  log('binaries -> ffmpeg:', FFMPEG, '| yt-dlp:', YTDLP, '| cookies:', COOKIES ? 'loaded' : 'none');
 });
 
 process.on('uncaughtException', (e) => log('uncaughtException', e));
