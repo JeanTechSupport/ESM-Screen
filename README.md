@@ -97,6 +97,17 @@ confirm you're not a bot."* The fix is to authenticate with cookies:
 Cookies expire and can be invalidated over time; re-export and update the secret
 file if the stream starts failing again. Set `YTDLP_COOKIES` to override the path.
 
+Cookies alone aren't enough from a datacenter IP anymore — YouTube also wants a
+**proof-of-origin (PO) token**. The Docker image bundles the
+[`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+server (a small Node HTTP service on `127.0.0.1:4416`, started alongside the
+relay by `start.sh`) plus its yt-dlp plugin, so yt-dlp mints PO tokens locally
+and auto-discovers the provider — no config needed. This is why the relay is
+deployed via the Dockerfile rather than the plain Node runtime. Heads-up: the
+provider adds memory pressure, so if the free instance OOM-restarts, move to a
+larger Render plan. The `YTDLP_EXTRACTOR_ARGS` env var is available to switch
+player clients (e.g. `youtube:player_client=tv,web_safari`) without a redeploy.
+
 ## Caveats
 
 - This relies on `yt-dlp`, which plays cat-and-mouse with YouTube and breaks

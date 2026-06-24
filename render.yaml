@@ -2,19 +2,21 @@
 # This repo IS the relay (files live at the root), so no rootDir is needed:
 # New -> Blueprint in the Render dashboard, pick this repo + branch -> Apply.
 #
+# Built from ./Dockerfile (runtime: docker), which bundles a yt-dlp PO-token
+# provider so YouTube doesn't bot-wall Render's datacenter IP. See the Dockerfile
+# and README for the cookies secret file the relay also needs.
+#
 # Free plan suits a screen that's only on during the day: it spins down when no
 # TV is connected (nothing billed overnight) and cold-starts in ~30-60s on the
 # first morning connection. No healthCheckPath on purpose, so Render lets it
-# idle instead of pinging it awake 24/7. For always-on with no cold start,
-# change `plan: free` to `plan: starter`. Docker alternative: ./Dockerfile.
+# idle instead of pinging it awake 24/7. The PO-token provider adds memory
+# pressure though; if the instance OOM-restarts on free, bump to a larger plan.
 services:
   - type: web
     name: esm-lofi-relay
-    runtime: node
+    runtime: docker
     plan: free
     region: frankfurt
-    buildCommand: npm install
-    startCommand: npm start
     envVars:
       - key: STREAM_URL
         value: https://www.youtube.com/@LofiGirl/live
