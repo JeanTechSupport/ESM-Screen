@@ -42,6 +42,12 @@ try {
   }
 } catch (e) { console.error('cookies setup failed:', e.message); }
 
+// Optional yt-dlp extractor args, e.g. "youtube:player_client=tv,web_safari".
+// Lets us work around an occasional "No video formats found" on the live stream
+// by switching player clients without a redeploy — set YTDLP_EXTRACTOR_ARGS in
+// the Render environment. Empty -> yt-dlp's defaults.
+const EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || '';
+
 const PORT = parseInt(process.env.PORT, 10) || 10000;
 const STREAM_URL = process.env.STREAM_URL || 'https://www.youtube.com/@LofiGirl/live';
 const BITRATE = process.env.BITRATE || '128k';
@@ -94,6 +100,7 @@ function resolveAudioUrl() {
       '--no-playlist',
     ];
     if (COOKIES) args.push('--cookies', COOKIES);
+    if (EXTRACTOR_ARGS) args.push('--extractor-args', EXTRACTOR_ARGS);
     args.push(STREAM_URL);
     const yt = spawn(YTDLP, args);
     let out = '', err = '';
