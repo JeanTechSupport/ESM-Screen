@@ -65,6 +65,10 @@ let restartTimer = null;
 let idleTimer = null;
 let backoffMs = 1000;
 let lastError = null;
+let lastStderr = null;        // full stderr from the last failed resolve (diagnostics)
+let lastResolveArgs = null;   // the exact yt-dlp command of the last resolve (diagnostics)
+let ytdlpVersion = 'unknown';
+const POT_PORT = parseInt(process.env.POT_PORT, 10) || 4416;
 
 // Small ring buffer of the most recent MP3 bytes so a newly-connected TV starts
 // playing immediately instead of waiting for the next ffmpeg chunk.
@@ -90,6 +94,35 @@ function removeListener(res) {
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 
+// Run a command to completion, capturing stdout/stderr (used by /diag and the
+// startup version probe). Never rejects; resolves {code,out,err}.
+function runCapture(bin, args, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    let out = '', err = '', child;
+    try { child = spawn(bin, args); }
+    catch (e) { return resolve({ code: -1, out, err: String(e) }); }
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    child.on('error', (e) => { clearTimeout(t); resolve({ code: -1, out, err: err + String(e) }); });
+    child.on('close', (code) => { clearTimeout(t); resolve({ code, out, err }); });
+  });
+}
+
+// Is the local PO-token provider answering? Probed for /status and /diag so we
+// can tell "provider down" apart from "provider up but token rejected".
+function probeProvider(timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port: POT_PORT, path: '/ping', timeout: timeoutMs }, (res) => {
+      let body = '';
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve(`reachable (HTTP ${res.statusCode})${body ? ' ' + body.slice(0, 160).replace(/\s+/g, ' ').trim() : ''}`));
+    });
+    req.on('timeout', () => { req.destroy(); resolve('unreachable (timeout)'); });
+    req.on('error', (e) => resolve(`unreachable (${e.code || e.message})`));
+  });
+}
+
 // Resolve the current live audio URL with yt-dlp (-g prints the direct media URL).
 function resolveAudioUrl() {
   return new Promise((resolve, reject) => {
@@ -102,6 +135,7 @@ function resolveAudioUrl() {
     if (COOKIES) args.push('--cookies', COOKIES);
     if (EXTRACTOR_ARGS) args.push('--extractor-args', EXTRACTOR_ARGS);
     args.push(STREAM_URL);
+    lastResolveArgs = [YTDLP, ...args].join(' ');
     const yt = spawn(YTDLP, args);
     let out = '', err = '';
     yt.stdout.on('data', (d) => (out += d));
@@ -109,8 +143,8 @@ function resolveAudioUrl() {
     yt.on('error', reject);
     yt.on('close', (code) => {
       const url = out.split('\n').map((s) => s.trim()).filter(Boolean)[0];
-      if (code === 0 && url) resolve(url);
-      else reject(new Error(`yt-dlp exited ${code}: ${err.trim() || 'no URL returned'}`));
+      if (code === 0 && url) { lastStderr = err || null; resolve(url); }
+      else { lastStderr = err; reject(new Error(`yt-dlp exited ${code}: ${err.trim() || 'no URL returned'}`)); }
     });
   });
 }
@@ -192,7 +226,7 @@ function scheduleIdleStop() {
   }, IDLE_TIMEOUT_MS);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const path = (req.url || '/').split('?')[0];
 
   if (path === '/healthz') {
@@ -201,13 +235,46 @@ const server = http.createServer((req, res) => {
   }
 
   if (path === '/status') {
+    const potProvider = await probeProvider();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       source: STREAM_URL,
       listeners: listeners.size,
       upstream: proc ? 'running' : 'stopped',
       lastError,
+      ytdlpVersion,
+      cookies: !!COOKIES,
+      extractorArgs: EXTRACTOR_ARGS || null,
+      potProvider,
+      lastArgs: lastResolveArgs,
+      lastStderrTail: lastStderr ? lastStderr.slice(-2500) : null,
     }, null, 2));
+  }
+
+  // On-demand verbose probe: runs yt-dlp -v against the stream and returns the
+  // full output, so we can see whether the PO-token plugin loaded, which player
+  // clients were tried, and whether a token was fetched. Optional overrides
+  // (no redeploy needed to experiment):
+  //   /diag?client=tv,web_safari  -> --extractor-args youtube:player_client=...
+  //   /diag?args=<raw>            -> --extractor-args <raw>
+  // Whichever combo prints "exit: 0" with a url is what to bake into the
+  // YTDLP_EXTRACTOR_ARGS env var.
+  if (path === '/diag') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const raw = q.get('args');
+    const client = q.get('client');
+    const extractor = raw || (client ? `youtube:player_client=${client}` : EXTRACTOR_ARGS);
+    const args = ['-v', '-g', '-f', 'bestaudio/best', '--no-playlist'];
+    if (COOKIES) args.push('--cookies', COOKIES);
+    if (extractor) args.push('--extractor-args', extractor);
+    args.push(STREAM_URL);
+    const provider = await probeProvider();
+    const r = await runCapture(YTDLP, args, 90000);
+    const url = r.out.trim().split('\n')[0] || '(none)';
+    const head = `# yt-dlp ${ytdlpVersion}\n# cookies: ${!!COOKIES}\n# pot provider: ${provider}\n`
+      + `# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
+    res.writeHead(r.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end((head + '===== STDERR (verbose) =====\n' + r.err + '\n===== STDOUT =====\n' + r.out).slice(0, 80000));
   }
 
   if (path === '/') {
@@ -218,7 +285,7 @@ const server = http.createServer((req, res) => {
 <p>Always-on MP3 of the Lofi Girl live feed for the office TVs — no video, no ads.</p>
 <p>Stream URL: <code>/lofi.mp3</code></p>
 <audio controls autoplay src="/lofi.mp3"></audio>
-<p><a style="color:#8bf" href="/status">/status</a></p>`);
+<p><a style="color:#8bf" href="/status">/status</a> · <a style="color:#8bf" href="/diag">/diag</a></p>`);
   }
 
   if (path === '/lofi.mp3' || path === '/lofi') {
@@ -254,6 +321,10 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   log(`relay listening on :${PORT}, source ${STREAM_URL}`);
   log('binaries -> ffmpeg:', FFMPEG, '| yt-dlp:', YTDLP, '| cookies:', COOKIES ? 'loaded' : 'none');
+  runCapture(YTDLP, ['--version'], 10000).then((r) => {
+    ytdlpVersion = (r.out || '').trim() || 'unknown';
+    log('yt-dlp version:', ytdlpVersion, '| PO-token port:', POT_PORT);
+  });
 });
 
 process.on('uncaughtException', (e) => log('uncaughtException', e));
