@@ -102,8 +102,10 @@ Cookies alone aren't enough from a datacenter IP anymore — YouTube also wants 
 [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
 server (a small Node HTTP service on `127.0.0.1:4416`, started alongside the
 relay by `start.sh`) plus its yt-dlp plugin, so yt-dlp mints PO tokens locally
-and auto-discovers the provider — no config needed. This is why the relay is
-deployed via the Dockerfile rather than the plain Node runtime. Heads-up: the
+and auto-discovers the provider — no config needed. The image also installs
+**Deno**: yt-dlp 2026+ needs a JS runtime for YouTube's player JS challenge, or
+extraction falls back to clients that only return `LOGIN_REQUIRED`. This is why
+the relay is deployed via the Dockerfile rather than the plain Node runtime. Heads-up: the
 provider adds memory pressure, so if the free instance OOM-restarts, move to a
 larger Render plan. The `YTDLP_EXTRACTOR_ARGS` env var is available to switch
 player clients (e.g. `youtube:player_client=tv,web_safari`) without a redeploy.

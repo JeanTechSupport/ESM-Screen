@@ -91,27 +91,40 @@ Pushing to JeanTechSupport auto-deploys on Render.
 
 ## 4. ⚠️ EXACT CURRENT STATE
 
-- **JeanCamposLabs `main` = `ef874f8`** (has diagnostics).
-- **Render is running the PREVIOUS commit** (`c7843a9` = PO provider, **no
-  diagnostics**). The user has **not re-synced `ef874f8` yet.**
-- Last observed `/status`: `upstream: stopped`, and after pressing play,
-  `lastError: ... Sign in to confirm you're not a bot ... Use --cookies`.
+**Root cause FOUND** via `/diag` (diagnostics commit `ef874f8` got deployed and
+tested). The blocker was **not the cookies** — yt-dlp 2026 needs a **JavaScript
+runtime** for YouTube's player JS challenge. Verbose output showed:
+```
+WARNING: [youtube] No supported JavaScript runtime could be found...
+[jsc] JS Challenge Providers: deno (unavailable), node (unavailable), ...
+[youtube] Downloading android vr player API JSON
+[youtube] android_vr ... playability status: LOGIN_REQUIRED
+```
+With no JS runtime, yt-dlp skips the web/tv clients (the ones that use our PO
+token + cookies) and falls back to the JS-free `android_vr` client → bot wall.
+The PO-token provider itself is healthy (`bgutil:http-1.3.1` loaded; `/status`
+showed `potProvider: reachable (HTTP 200) ... version 1.3.1`).
+
+**Fix applied (latest commit, pushed to JeanCamposLabs `main`, NOT yet
+deployed):** install **Deno** in the Dockerfile
+(`COPY --from=denoland/deno:bin /deno /usr/local/bin/deno`) — the runtime yt-dlp
+enables by default. Added a `YTDLP_JS_RUNTIMES` env lever, a `/diag?jsruntimes=`
+override, and a `jsRuntimes` field in `/status`.
 
 ### → IMMEDIATE NEXT STEP
-Have the user run the re-sync ritual (§2) to deploy `ef874f8` (fast build — only
-`server.js` changed, Docker layers are cached), then collect:
-
-1. **`/status`** (JSON) — note `ytdlpVersion`, `cookies`, **`potProvider`**
-   (is the token server reachable from yt-dlp?), `lastArgs`, `lastStderrTail`.
-2. **`/diag`** (full text, ~10–30s) — shows in verbose yt-dlp output whether the
-   **bgutil plugin loaded**, which **player clients** were tried, and whether a
-   **PO token was fetched**.
-3. **Client scan** — open each and read the `# exit:` / `# url:` header lines;
-   we want one that says **`exit: 0`** with a real URL:
-   - `/diag?client=default`
-   - `/diag?client=tv`
-   - `/diag?client=mweb`
-   - `/diag?client=tv,web_safari,mweb,web`
+1. User re-syncs (ritual in §2) to deploy the deno fix. This IS a Dockerfile
+   change, so the build pulls `denoland/deno:bin` (~1 min extra); other layers
+   stay cached.
+2. Check **`/diag`** — verbose should now show `JS runtimes: deno` (not "none"),
+   try the web/tv clients, fetch a PO token, and print **`# exit: 0`** with a
+   URL. Then **`/status`** → `upstream: running` once a TV is connected.
+3. If it STILL bot-walls once deno is active:
+   - the **cookies may genuinely be stale** — re-export from a fresh throwaway
+     account and update the `cookies.txt` Secret File;
+   - try the client scan `/diag?client=tv` / `mweb` / `tv,web_safari,mweb,web`
+     and bake the winner into `YTDLP_EXTRACTOR_ARGS`;
+   - as a fallback runtime, set env `YTDLP_JS_RUNTIMES=node:/usr/local/bin/node`
+     (we run on the node base image) or `/diag?jsruntimes=node:/usr/local/bin/node`.
 
 ---
 

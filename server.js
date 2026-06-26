@@ -48,6 +48,12 @@ try {
 // the Render environment. Empty -> yt-dlp's defaults.
 const EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || '';
 
+// yt-dlp 2026+ needs a JS runtime (deno/node/...) for YouTube's player JS
+// challenge; the Docker image installs deno, which yt-dlp uses by default. Set
+// YTDLP_JS_RUNTIMES to force one, e.g. "node:/usr/local/bin/node" or "deno"
+// (empty string -> let yt-dlp pick its default).
+const JS_RUNTIMES = 'YTDLP_JS_RUNTIMES' in process.env ? process.env.YTDLP_JS_RUNTIMES : '';
+
 const PORT = parseInt(process.env.PORT, 10) || 10000;
 const STREAM_URL = process.env.STREAM_URL || 'https://www.youtube.com/@LofiGirl/live';
 const BITRATE = process.env.BITRATE || '128k';
@@ -132,6 +138,7 @@ function resolveAudioUrl() {
       '--no-warnings',
       '--no-playlist',
     ];
+    if (JS_RUNTIMES) args.push('--js-runtimes', JS_RUNTIMES);
     if (COOKIES) args.push('--cookies', COOKIES);
     if (EXTRACTOR_ARGS) args.push('--extractor-args', EXTRACTOR_ARGS);
     args.push(STREAM_URL);
@@ -245,6 +252,7 @@ const server = http.createServer(async (req, res) => {
       ytdlpVersion,
       cookies: !!COOKIES,
       extractorArgs: EXTRACTOR_ARGS || null,
+      jsRuntimes: JS_RUNTIMES || '(yt-dlp default)',
       potProvider,
       lastArgs: lastResolveArgs,
       lastStderrTail: lastStderr ? lastStderr.slice(-2500) : null,
@@ -264,7 +272,9 @@ const server = http.createServer(async (req, res) => {
     const raw = q.get('args');
     const client = q.get('client');
     const extractor = raw || (client ? `youtube:player_client=${client}` : EXTRACTOR_ARGS);
+    const jsr = q.has('jsruntimes') ? q.get('jsruntimes') : JS_RUNTIMES;
     const args = ['-v', '-g', '-f', 'bestaudio/best', '--no-playlist'];
+    if (jsr) args.push('--js-runtimes', jsr);
     if (COOKIES) args.push('--cookies', COOKIES);
     if (extractor) args.push('--extractor-args', extractor);
     args.push(STREAM_URL);
@@ -272,7 +282,7 @@ const server = http.createServer(async (req, res) => {
     const r = await runCapture(YTDLP, args, 90000);
     const url = r.out.trim().split('\n')[0] || '(none)';
     const head = `# yt-dlp ${ytdlpVersion}\n# cookies: ${!!COOKIES}\n# pot provider: ${provider}\n`
-      + `# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
+      + `# js-runtimes: ${jsr || '(yt-dlp default)'}\n# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
     res.writeHead(r.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end((head + '===== STDERR (verbose) =====\n' + r.err + '\n===== STDOUT =====\n' + r.out).slice(0, 80000));
   }

@@ -24,6 +24,12 @@ ADD https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest /tmp/ytdlp-releas
 RUN pip3 install --no-cache-dir --break-system-packages -U \
       yt-dlp bgutil-ytdlp-pot-provider
 
+# yt-dlp 2026+ needs a JS runtime to solve YouTube's player JS challenge; without
+# one it falls back to JS-free clients (android_vr) that just return
+# LOGIN_REQUIRED, so the bot wall never lifts. Deno is the runtime yt-dlp enables
+# by default — drop the static binary onto PATH and yt-dlp picks it up.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 # The relay itself.
 WORKDIR /relay
 COPY package.json server.js start.sh ./
