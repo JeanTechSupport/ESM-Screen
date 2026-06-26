@@ -105,26 +105,33 @@ token + cookies) and falls back to the JS-free `android_vr` client → bot wall.
 The PO-token provider itself is healthy (`bgutil:http-1.3.1` loaded; `/status`
 showed `potProvider: reachable (HTTP 200) ... version 1.3.1`).
 
-**Fix applied (latest commit, pushed to JeanCamposLabs `main`, NOT yet
-deployed):** install **Deno** in the Dockerfile
-(`COPY --from=denoland/deno:bin /deno /usr/local/bin/deno`) — the runtime yt-dlp
-enables by default. Added a `YTDLP_JS_RUNTIMES` env lever, a `/diag?jsruntimes=`
-override, and a `jsRuntimes` field in `/status`.
+### Progress chain (each step deployed & verified via /diag)
+1. **Deno installed** (`COPY --from=denoland/deno:bin`) → JS runtime active
+   (`JS runtimes: deno-2.9.0`). yt-dlp then tried web_safari, but → `LOGIN_REQUIRED`.
+2. **Cookies refreshed** (new Secret File) → `Found YouTube account cookies`, and
+   the **PO token now works**: `Generating/Retrieved a gvs PO Token for web_safari
+   client via bgutil HTTP server`. Auth + bot wall solved. New error:
+   `No video formats found`.
+3. **Final blocker:** the EJS **challenge solver script** is missing —
+   `[jsc:deno] challenge solving failed` + `Remote components ... were skipped`.
+   yt-dlp won't download the solver unless allowed.
+
+**Fix applied (latest commit, pushed to JeanCamposLabs `main`):** add
+**`--remote-components ejs:github`** to the yt-dlp calls (server.js), via a
+`YTDLP_REMOTE_COMPONENTS` env lever (default `ejs:github`) + `/diag?remote=`
+override + `remoteComponents` in `/status`. This is a server.js-only change
+(fast rebuild). yt-dlp downloads the solver from the yt-dlp org at first resolve
+and caches it.
 
 ### → IMMEDIATE NEXT STEP
-1. User re-syncs (ritual in §2) to deploy the deno fix. This IS a Dockerfile
-   change, so the build pulls `denoland/deno:bin` (~1 min extra); other layers
-   stay cached.
-2. Check **`/diag`** — verbose should now show `JS runtimes: deno` (not "none"),
-   try the web/tv clients, fetch a PO token, and print **`# exit: 0`** with a
-   URL. Then **`/status`** → `upstream: running` once a TV is connected.
-3. If it STILL bot-walls once deno is active:
-   - the **cookies may genuinely be stale** — re-export from a fresh throwaway
-     account and update the `cookies.txt` Secret File;
-   - try the client scan `/diag?client=tv` / `mweb` / `tv,web_safari,mweb,web`
-     and bake the winner into `YTDLP_EXTRACTOR_ARGS`;
-   - as a fallback runtime, set env `YTDLP_JS_RUNTIMES=node:/usr/local/bin/node`
-     (we run on the node base image) or `/diag?jsruntimes=node:/usr/local/bin/node`.
+1. User re-syncs (ritual §2) + deploy (fast — only server.js changed).
+2. Check **`/diag`** → expect `challenge solving` to succeed and **`# exit: 0`**
+   with a URL. Then `/status` → `upstream: running` and the wall plays. 🎧
+3. If `/diag` shows formats but the audio still won't play, it's a stream/ffmpeg
+   issue, not extraction — check ffmpeg logs.
+4. If remote-components download is blocked/undesirable, the robust alternative is
+   to pre-bundle the EJS solver into the image at build (see yt-dlp EJS wiki) and
+   set `YTDLP_REMOTE_COMPONENTS=""`.
 
 ---
 

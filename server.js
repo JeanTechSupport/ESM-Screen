@@ -54,6 +54,15 @@ const EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || '';
 // (empty string -> let yt-dlp pick its default).
 const JS_RUNTIMES = 'YTDLP_JS_RUNTIMES' in process.env ? process.env.YTDLP_JS_RUNTIMES : '';
 
+// Having a JS runtime isn't enough: yt-dlp also needs the EJS "challenge solver"
+// script, which it won't fetch unless remote components are enabled. ejs:github
+// pulls it from the yt-dlp org (the recommended source). Without it, challenge
+// solving fails and you get "No video formats found". Override/disable via
+// YTDLP_REMOTE_COMPONENTS.
+const REMOTE_COMPONENTS = 'YTDLP_REMOTE_COMPONENTS' in process.env
+  ? process.env.YTDLP_REMOTE_COMPONENTS
+  : 'ejs:github';
+
 const PORT = parseInt(process.env.PORT, 10) || 10000;
 const STREAM_URL = process.env.STREAM_URL || 'https://www.youtube.com/@LofiGirl/live';
 const BITRATE = process.env.BITRATE || '128k';
@@ -139,6 +148,7 @@ function resolveAudioUrl() {
       '--no-playlist',
     ];
     if (JS_RUNTIMES) args.push('--js-runtimes', JS_RUNTIMES);
+    if (REMOTE_COMPONENTS) args.push('--remote-components', REMOTE_COMPONENTS);
     if (COOKIES) args.push('--cookies', COOKIES);
     if (EXTRACTOR_ARGS) args.push('--extractor-args', EXTRACTOR_ARGS);
     args.push(STREAM_URL);
@@ -253,6 +263,7 @@ const server = http.createServer(async (req, res) => {
       cookies: !!COOKIES,
       extractorArgs: EXTRACTOR_ARGS || null,
       jsRuntimes: JS_RUNTIMES || '(yt-dlp default)',
+      remoteComponents: REMOTE_COMPONENTS || '(none)',
       potProvider,
       lastArgs: lastResolveArgs,
       lastStderrTail: lastStderr ? lastStderr.slice(-2500) : null,
@@ -273,16 +284,18 @@ const server = http.createServer(async (req, res) => {
     const client = q.get('client');
     const extractor = raw || (client ? `youtube:player_client=${client}` : EXTRACTOR_ARGS);
     const jsr = q.has('jsruntimes') ? q.get('jsruntimes') : JS_RUNTIMES;
+    const remote = q.has('remote') ? q.get('remote') : REMOTE_COMPONENTS;
     const args = ['-v', '-g', '-f', 'bestaudio/best', '--no-playlist'];
     if (jsr) args.push('--js-runtimes', jsr);
+    if (remote) args.push('--remote-components', remote);
     if (COOKIES) args.push('--cookies', COOKIES);
     if (extractor) args.push('--extractor-args', extractor);
     args.push(STREAM_URL);
     const provider = await probeProvider();
-    const r = await runCapture(YTDLP, args, 90000);
+    const r = await runCapture(YTDLP, args, 120000);
     const url = r.out.trim().split('\n')[0] || '(none)';
     const head = `# yt-dlp ${ytdlpVersion}\n# cookies: ${!!COOKIES}\n# pot provider: ${provider}\n`
-      + `# js-runtimes: ${jsr || '(yt-dlp default)'}\n# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
+      + `# js-runtimes: ${jsr || '(yt-dlp default)'}\n# remote-components: ${remote || '(none)'}\n# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
     res.writeHead(r.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end((head + '===== STDERR (verbose) =====\n' + r.err + '\n===== STDOUT =====\n' + r.out).slice(0, 80000));
   }
