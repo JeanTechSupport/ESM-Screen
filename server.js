@@ -42,6 +42,12 @@ try {
   }
 } catch (e) { console.error('cookies setup failed:', e.message); }
 
+// Set YTDLP_DISABLE_COOKIES to ignore the cookies file entirely. With a PO token,
+// a *public* live stream can resolve anonymously — and stale/invalidated cookies
+// actively cause LOGIN_REQUIRED, so going cookieless is often MORE robust (nothing
+// to expire). Test per-request first via /diag?nocookies=1.
+const DISABLE_COOKIES = 'YTDLP_DISABLE_COOKIES' in process.env;
+
 // Optional yt-dlp extractor args, e.g. "youtube:player_client=tv,web_safari".
 // Lets us work around an occasional "No video formats found" on the live stream
 // by switching player clients without a redeploy — set YTDLP_EXTRACTOR_ARGS in
@@ -149,7 +155,7 @@ function resolveAudioUrl() {
     ];
     if (JS_RUNTIMES) args.push('--js-runtimes', JS_RUNTIMES);
     if (REMOTE_COMPONENTS) args.push('--remote-components', REMOTE_COMPONENTS);
-    if (COOKIES) args.push('--cookies', COOKIES);
+    if (COOKIES && !DISABLE_COOKIES) args.push('--cookies', COOKIES);
     if (EXTRACTOR_ARGS) args.push('--extractor-args', EXTRACTOR_ARGS);
     args.push(STREAM_URL);
     lastResolveArgs = [YTDLP, ...args].join(' ');
@@ -261,6 +267,7 @@ const server = http.createServer(async (req, res) => {
       lastError,
       ytdlpVersion,
       cookies: !!COOKIES,
+      cookiesUsed: !!(COOKIES && !DISABLE_COOKIES),
       extractorArgs: EXTRACTOR_ARGS || null,
       jsRuntimes: JS_RUNTIMES || '(yt-dlp default)',
       remoteComponents: REMOTE_COMPONENTS || '(none)',
@@ -285,16 +292,17 @@ const server = http.createServer(async (req, res) => {
     const extractor = raw || (client ? `youtube:player_client=${client}` : EXTRACTOR_ARGS);
     const jsr = q.has('jsruntimes') ? q.get('jsruntimes') : JS_RUNTIMES;
     const remote = q.has('remote') ? q.get('remote') : REMOTE_COMPONENTS;
+    const useCookies = !!COOKIES && !DISABLE_COOKIES && !q.has('nocookies');
     const args = ['-v', '-g', '-f', 'bestaudio/best', '--no-playlist'];
     if (jsr) args.push('--js-runtimes', jsr);
     if (remote) args.push('--remote-components', remote);
-    if (COOKIES) args.push('--cookies', COOKIES);
+    if (useCookies) args.push('--cookies', COOKIES);
     if (extractor) args.push('--extractor-args', extractor);
     args.push(STREAM_URL);
     const provider = await probeProvider();
     const r = await runCapture(YTDLP, args, 120000);
     const url = r.out.trim().split('\n')[0] || '(none)';
-    const head = `# yt-dlp ${ytdlpVersion}\n# cookies: ${!!COOKIES}\n# pot provider: ${provider}\n`
+    const head = `# yt-dlp ${ytdlpVersion}\n# cookies-used: ${useCookies}\n# pot provider: ${provider}\n`
       + `# js-runtimes: ${jsr || '(yt-dlp default)'}\n# remote-components: ${remote || '(none)'}\n# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
     res.writeHead(r.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end((head + '===== STDERR (verbose) =====\n' + r.err + '\n===== STDOUT =====\n' + r.out).slice(0, 80000));
