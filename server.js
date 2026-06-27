@@ -293,16 +293,18 @@ const server = http.createServer(async (req, res) => {
     const jsr = q.has('jsruntimes') ? q.get('jsruntimes') : JS_RUNTIMES;
     const remote = q.has('remote') ? q.get('remote') : REMOTE_COMPONENTS;
     const useCookies = !!COOKIES && !DISABLE_COOKIES && !q.has('nocookies');
-    const args = ['-v', '-g', '-f', 'bestaudio/best', '--no-playlist'];
+    const target = q.get('url') || STREAM_URL;   // ?url= to test any source (e.g. a SoundCloud link)
+    const args = ['-v', '-g', '-f', 'bestaudio/best'];
+    args.push(...(q.has('url') ? ['--playlist-items', '1'] : ['--no-playlist']));
     if (jsr) args.push('--js-runtimes', jsr);
     if (remote) args.push('--remote-components', remote);
     if (useCookies) args.push('--cookies', COOKIES);
     if (extractor) args.push('--extractor-args', extractor);
-    args.push(STREAM_URL);
+    args.push(target);
     const provider = await probeProvider();
     const r = await runCapture(YTDLP, args, 120000);
     const url = r.out.trim().split('\n')[0] || '(none)';
-    const head = `# yt-dlp ${ytdlpVersion}\n# cookies-used: ${useCookies}\n# pot provider: ${provider}\n`
+    const head = `# yt-dlp ${ytdlpVersion}\n# target: ${target}\n# cookies-used: ${useCookies}\n# pot provider: ${provider}\n`
       + `# js-runtimes: ${jsr || '(yt-dlp default)'}\n# remote-components: ${remote || '(none)'}\n# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
     res.writeHead(r.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end((head + '===== STDERR (verbose) =====\n' + r.err + '\n===== STDOUT =====\n' + r.out).slice(0, 80000));
