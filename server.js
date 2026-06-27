@@ -1,98 +1,61 @@
 'use strict';
 /**
- * ESM-Screen lofi relay
+ * ESM-Screen lofi relay (SoundCloud edition)
  * --------------------------------------------------------------------------
- * Turns the Lofi Girl YouTube *live* stream into a plain, always-on MP3 feed
- * that the office TVs play in their existing <audio> element — no video decode
- * (so no lag on weak TV chips) and no YouTube player (so no ads).
+ * Streams Lofi Girl's catalogue as a plain, always-on MP3 the office TVs play
+ * in their existing <audio> element — no video, no ads, no YouTube.
  *
- * One upstream is shared by every TV: yt-dlp resolves the current live audio
- * URL, ffmpeg transcodes it to MP3, and we fan the same bytes out to all
- * connected listeners. When YouTube rotates the URL or Lofi Girl restarts the
- * stream the upstream simply dies; we re-resolve and restart, while the TVs
- * keep playing the one stable URL (/lofi.mp3) and never notice.
+ * Why SoundCloud and not the YouTube live feed: YouTube bot-walls datacenter
+ * IPs (Render) at the login layer, and the only thing that gets past it —
+ * account cookies — gets invalidated within hours. SoundCloud hosts the same
+ * Lofi Girl label catalogue and resolves cleanly from a server with plain
+ * yt-dlp (no cookies / PO tokens / JS runtime needed). We flat-list the source
+ * into track permalinks, shuffle, then resolve + transcode them one after
+ * another, looping forever. The TVs hit one stable URL (/lofi.mp3) throughout.
  */
 
 const http = require('http');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-// Resolve the ffmpeg / yt-dlp binaries. On Render's native Node runtime these
-// come from npm (ffmpeg-static) and the postinstall download (./bin/yt-dlp);
-// in Docker / locally they're system packages on PATH. Env vars override both.
+// ffmpeg/yt-dlp: in Docker they're system packages on PATH (apt ffmpeg, pip
+// yt-dlp); locally they fall back to PATH too. Env vars override.
 function tryRequire(name) { try { return require(name); } catch { return null; } }
 const FFMPEG = process.env.FFMPEG_PATH || tryRequire('ffmpeg-static') || 'ffmpeg';
-const LOCAL_YTDLP = path.join(__dirname, 'bin', 'yt-dlp');
-const YTDLP = process.env.YTDLP_PATH
-  || (fs.existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp');
-
-// Optional YouTube cookies to get past datacenter-IP bot checks ("Sign in to
-// confirm you're not a bot"). On Render, upload the Netscape-format cookies as a
-// Secret File named cookies.txt — it mounts read-only at /etc/secrets/cookies.txt.
-// We copy it to a writable temp path so yt-dlp can refresh the jar in place.
-// No file present -> we just run without cookies.
-const COOKIES_SRC = process.env.YTDLP_COOKIES || '/etc/secrets/cookies.txt';
-let COOKIES = null;
-try {
-  if (fs.existsSync(COOKIES_SRC)) {
-    COOKIES = path.join(os.tmpdir(), 'yt-cookies.txt');
-    fs.copyFileSync(COOKIES_SRC, COOKIES);
-  }
-} catch (e) { console.error('cookies setup failed:', e.message); }
-
-// Set YTDLP_DISABLE_COOKIES to ignore the cookies file entirely. With a PO token,
-// a *public* live stream can resolve anonymously — and stale/invalidated cookies
-// actively cause LOGIN_REQUIRED, so going cookieless is often MORE robust (nothing
-// to expire). Test per-request first via /diag?nocookies=1.
-const DISABLE_COOKIES = 'YTDLP_DISABLE_COOKIES' in process.env;
-
-// Optional yt-dlp extractor args, e.g. "youtube:player_client=tv,web_safari".
-// Lets us work around an occasional "No video formats found" on the live stream
-// by switching player clients without a redeploy — set YTDLP_EXTRACTOR_ARGS in
-// the Render environment. Empty -> yt-dlp's defaults.
-const EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || '';
-
-// yt-dlp 2026+ needs a JS runtime (deno/node/...) for YouTube's player JS
-// challenge; the Docker image installs deno, which yt-dlp uses by default. Set
-// YTDLP_JS_RUNTIMES to force one, e.g. "node:/usr/local/bin/node" or "deno"
-// (empty string -> let yt-dlp pick its default).
-const JS_RUNTIMES = 'YTDLP_JS_RUNTIMES' in process.env ? process.env.YTDLP_JS_RUNTIMES : '';
-
-// Having a JS runtime isn't enough: yt-dlp also needs the EJS "challenge solver"
-// script, which it won't fetch unless remote components are enabled. ejs:github
-// pulls it from the yt-dlp org (the recommended source). Without it, challenge
-// solving fails and you get "No video formats found". Override/disable via
-// YTDLP_REMOTE_COMPONENTS.
-const REMOTE_COMPONENTS = 'YTDLP_REMOTE_COMPONENTS' in process.env
-  ? process.env.YTDLP_REMOTE_COMPONENTS
-  : 'ejs:github';
+const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 
 const PORT = parseInt(process.env.PORT, 10) || 10000;
-const STREAM_URL = process.env.STREAM_URL || 'https://www.youtube.com/@LofiGirl/live';
+// A SoundCloud user/playlist/track URL. The profile resolves to "Lofi Girl (All)".
+const SOURCE_URL = process.env.STREAM_URL || 'https://soundcloud.com/lofi_girl';
 const BITRATE = process.env.BITRATE || '128k';
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS, 10) || 60000; // stop upstream after last TV leaves
-const PREBUFFER_BYTES = parseInt(process.env.PREBUFFER_BYTES, 10) || 256 * 1024; // kickstart playback fast
-// Caps so a flood of connections or a stalled client can't exhaust the host.
-const MAX_LISTENERS = parseInt(process.env.MAX_LISTENERS, 10) || 50;             // reject new connections past this
-const MAX_CLIENT_BACKLOG = parseInt(process.env.MAX_CLIENT_BACKLOG, 10) || 4 * 1024 * 1024; // drop a TV buffering > this
+const SHUFFLE = process.env.SHUFFLE !== '0';                                  // shuffle the catalogue by default
+const MAX_TRACKS = parseInt(process.env.MAX_TRACKS, 10) || 300;              // cap how many tracks we list
+const RELIST_MS = parseInt(process.env.RELIST_MS, 10) || 6 * 60 * 60 * 1000; // refresh the track list every 6h
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS, 10) || 60000;  // stop after the last TV leaves
+const PREBUFFER_BYTES = parseInt(process.env.PREBUFFER_BYTES, 10) || 256 * 1024; // instant-start burst
+const MAX_LISTENERS = parseInt(process.env.MAX_LISTENERS, 10) || 50;
+const MAX_CLIENT_BACKLOG = parseInt(process.env.MAX_CLIENT_BACKLOG, 10) || 4 * 1024 * 1024;
 
 /** @type {Set<import('http').ServerResponse>} */
 const listeners = new Set();
-let proc = null;          // current { ffmpeg } pipeline, or null
-let starting = false;     // guard against concurrent starts
+let proc = null;            // current { ffmpeg } or null
+let starting = false;       // guard against concurrent starts
 let restartTimer = null;
 let idleTimer = null;
 let backoffMs = 1000;
 let lastError = null;
-let lastStderr = null;        // full stderr from the last failed resolve (diagnostics)
-let lastResolveArgs = null;   // the exact yt-dlp command of the last resolve (diagnostics)
-let ytdlpVersion = 'unknown';
-const POT_PORT = parseInt(process.env.POT_PORT, 10) || 4416;
+let lastStderr = null;      // stderr tail from the last failed resolve (diagnostics)
 
-// Small ring buffer of the most recent MP3 bytes so a newly-connected TV starts
-// playing immediately instead of waiting for the next ffmpeg chunk.
+let tracks = [];            // track permalink URLs to play in order
+let trackIdx = 0;
+let tracksLoadedAt = 0;
+let currentTrack = null;
+let ytdlpVersion = 'unknown';
+
+function log(...a) { console.log(new Date().toISOString(), ...a); }
+
+// Instant-start ring buffer of the most recent MP3 bytes.
 const prebuffer = [];
 let prebufferBytes = 0;
 function remember(chunk) {
@@ -104,19 +67,13 @@ function remember(chunk) {
 }
 function clearPrebuffer() { prebuffer.length = 0; prebufferBytes = 0; }
 
-// Single, idempotent cleanup path for a departing listener — called from the
-// request close/error handlers and when we drop a slow client. Schedules the
-// idle shutdown once the last TV is gone.
 function removeListener(res) {
   if (!listeners.delete(res)) return;
   log('listener -1 ->', listeners.size);
   if (listeners.size === 0) scheduleIdleStop();
 }
 
-function log(...a) { console.log(new Date().toISOString(), ...a); }
-
-// Run a command to completion, capturing stdout/stderr (used by /diag and the
-// startup version probe). Never rejects; resolves {code,out,err}.
+// Run a command to completion, capturing stdout/stderr. Never rejects.
 function runCapture(bin, args, timeoutMs = 60000) {
   return new Promise((resolve) => {
     let out = '', err = '', child;
@@ -130,72 +87,70 @@ function runCapture(bin, args, timeoutMs = 60000) {
   });
 }
 
-// Is the local PO-token provider answering? Probed for /status and /diag so we
-// can tell "provider down" apart from "provider up but token rejected".
-function probeProvider(timeoutMs = 800) {
-  return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port: POT_PORT, path: '/ping', timeout: timeoutMs }, (res) => {
-      let body = '';
-      res.on('data', (d) => (body += d));
-      res.on('end', () => resolve(`reachable (HTTP ${res.statusCode})${body ? ' ' + body.slice(0, 160).replace(/\s+/g, ' ').trim() : ''}`));
-    });
-    req.on('timeout', () => { req.destroy(); resolve('unreachable (timeout)'); });
-    req.on('error', (e) => resolve(`unreachable (${e.code || e.message})`));
-  });
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
-// Resolve the current live audio URL with yt-dlp (-g prints the direct media URL).
-function resolveAudioUrl() {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-g',                    // print resolved media URL(s) instead of downloading
-      '-f', 'bestaudio/best',  // prefer audio-only; fall back to best (we drop video below)
-      '--no-warnings',
-      '--no-playlist',
-    ];
-    if (JS_RUNTIMES) args.push('--js-runtimes', JS_RUNTIMES);
-    if (REMOTE_COMPONENTS) args.push('--remote-components', REMOTE_COMPONENTS);
-    if (COOKIES && !DISABLE_COOKIES) args.push('--cookies', COOKIES);
-    if (EXTRACTOR_ARGS) args.push('--extractor-args', EXTRACTOR_ARGS);
-    args.push(STREAM_URL);
-    lastResolveArgs = [YTDLP, ...args].join(' ');
-    const yt = spawn(YTDLP, args);
-    let out = '', err = '';
-    yt.stdout.on('data', (d) => (out += d));
-    yt.stderr.on('data', (d) => (err += d));
-    yt.on('error', reject);
-    yt.on('close', (code) => {
-      const url = out.split('\n').map((s) => s.trim()).filter(Boolean)[0];
-      if (code === 0 && url) { lastStderr = err || null; resolve(url); }
-      else { lastStderr = err; reject(new Error(`yt-dlp exited ${code}: ${err.trim() || 'no URL returned'}`)); }
-    });
-  });
+// Flat-list the source into track permalinks (fast; doesn't resolve media URLs).
+// Cached; refreshed every RELIST_MS so new releases get picked up.
+async function loadTracks(force) {
+  if (!force && tracks.length && (Date.now() - tracksLoadedAt) < RELIST_MS) return;
+  log('loading track list from', SOURCE_URL);
+  const r = await runCapture(YTDLP, [
+    '--flat-playlist', '--print', '%(url)s',
+    '--playlist-end', String(MAX_TRACKS), '--no-warnings', SOURCE_URL,
+  ], 120000);
+  let urls = r.out.split('\n').map((s) => s.trim()).filter((u) => /^https?:\/\//.test(u));
+  if (!urls.length) {                 // not a playlist (single track / direct) -> use as-is
+    urls = [SOURCE_URL];
+    if (r.code !== 0) lastError = 'track list load failed: ' + (r.err.trim().slice(-300) || 'no entries');
+  }
+  if (SHUFFLE) shuffle(urls);
+  tracks = urls;
+  trackIdx = 0;
+  tracksLoadedAt = Date.now();
+  log('loaded', tracks.length, 'tracks');
+}
+
+// Resolve one track permalink to a fresh, direct media URL (SoundCloud URLs expire).
+async function resolveTrack(permalink) {
+  const r = await runCapture(YTDLP, ['-g', '-f', 'bestaudio/best', '--no-playlist', '--no-warnings', permalink], 60000);
+  const url = r.out.split('\n').map((s) => s.trim()).filter(Boolean)[0];
+  if (r.code === 0 && url) { lastStderr = null; return url; }
+  lastStderr = r.err;
+  throw new Error(`yt-dlp exited ${r.code}: ${r.err.trim().slice(-200) || 'no URL returned'}`);
 }
 
 async function startPipeline() {
   if (proc || starting) return;
   starting = true;
   try {
-    log('resolving live audio URL from', STREAM_URL);
-    const url = await resolveAudioUrl();
+    await loadTracks(false);
+    if (!tracks.length) throw new Error('no tracks to play');
+    const permalink = tracks[trackIdx % tracks.length];
+    currentTrack = permalink;
+    log(`resolving track ${trackIdx + 1}/${tracks.length} ->`, permalink);
+    const url = await resolveTrack(permalink);
     log('resolved; starting ffmpeg transcode ->', BITRATE, 'mp3');
     const ffmpeg = spawn(FFMPEG, [
       '-hide_banner', '-loglevel', 'error',
-      // ride out brief network hiccups in the live feed instead of dying
       '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
       '-i', url,
-      '-vn',                              // drop video — TVs only ever get audio
+      '-vn',
       '-acodec', 'libmp3lame', '-b:a', BITRATE,
       '-f', 'mp3', 'pipe:1',
     ]);
     proc = { ffmpeg };
     ffmpeg.stdout.on('data', (chunk) => {
-      backoffMs = 1000;                   // healthy data flowing -> reset backoff
+      backoffMs = 1000;                 // healthy data -> reset backoff
       remember(chunk);
       for (const res of listeners) {
         try {
           res.write(chunk);
-          // A TV that can't keep up makes Node buffer unbounded RAM — cut it loose.
           if (res.writableLength > MAX_CLIENT_BACKLOG) {
             log('dropping slow listener (backlog over limit)');
             res.destroy();
@@ -205,29 +160,31 @@ async function startPipeline() {
       }
     });
     ffmpeg.stderr.on('data', (d) => { lastError = d.toString().trim(); });
-    const onExit = (why) => {
+    let advanced = false;
+    const onExit = (why, ok) => {
       if (!proc) return;
       proc = null;
       clearPrebuffer();
-      log('upstream ended:', why, '— listeners:', listeners.size);
-      if (listeners.size > 0) scheduleRestart();
+      log('track ended:', why, '— listeners:', listeners.size);
+      if (!advanced) { advanced = true; trackIdx = (trackIdx + 1) % tracks.length; } // advance to next track
+      if (listeners.size > 0) scheduleRestart(ok);
     };
-    ffmpeg.on('error', (e) => { lastError = String(e); onExit('ffmpeg error'); });
-    ffmpeg.on('close', (code) => onExit(`ffmpeg closed ${code}`));
+    ffmpeg.on('error', (e) => { lastError = String(e); onExit('ffmpeg error', false); });
+    ffmpeg.on('close', (code) => onExit(`ffmpeg closed ${code}`, code === 0));
   } catch (e) {
     lastError = String((e && e.message) || e);
     log('start failed:', lastError);
-    if (listeners.size > 0) scheduleRestart();
+    if (tracks.length) trackIdx = (trackIdx + 1) % tracks.length; // skip a bad/expired track
+    if (listeners.size > 0) scheduleRestart(false);
   } finally {
     starting = false;
   }
 }
 
-function scheduleRestart() {
+function scheduleRestart(ok) {
   if (restartTimer || proc) return;
-  const wait = backoffMs;
-  backoffMs = Math.min(backoffMs * 2, 30000); // exponential backoff, capped at 30s
-  log(`restarting upstream in ${wait}ms`);
+  const wait = ok ? 250 : backoffMs;            // quick segue between good tracks; back off on errors
+  if (!ok) backoffMs = Math.min(backoffMs * 2, 30000);
   restartTimer = setTimeout(() => { restartTimer = null; startPipeline(); }, wait);
 }
 
@@ -250,78 +207,56 @@ function scheduleIdleStop() {
 }
 
 const server = http.createServer(async (req, res) => {
-  const path = (req.url || '/').split('?')[0];
+  const route = (req.url || '/').split('?')[0];
 
-  if (path === '/healthz') {
+  if (route === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('ok');
   }
 
-  if (path === '/status') {
-    const potProvider = await probeProvider();
+  if (route === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
-      source: STREAM_URL,
+      source: SOURCE_URL,
       listeners: listeners.size,
-      upstream: proc ? 'running' : 'stopped',
-      lastError,
+      upstream: proc ? 'playing' : 'stopped',
+      tracks: tracks.length,
+      trackIndex: trackIdx,
+      currentTrack,
+      shuffle: SHUFFLE,
       ytdlpVersion,
-      cookies: !!COOKIES,
-      cookiesUsed: !!(COOKIES && !DISABLE_COOKIES),
-      extractorArgs: EXTRACTOR_ARGS || null,
-      jsRuntimes: JS_RUNTIMES || '(yt-dlp default)',
-      remoteComponents: REMOTE_COMPONENTS || '(none)',
-      potProvider,
-      lastArgs: lastResolveArgs,
-      lastStderrTail: lastStderr ? lastStderr.slice(-2500) : null,
+      lastError,
+      lastStderrTail: lastStderr ? lastStderr.slice(-1500) : null,
     }, null, 2));
   }
 
-  // On-demand verbose probe: runs yt-dlp -v against the stream and returns the
-  // full output, so we can see whether the PO-token plugin loaded, which player
-  // clients were tried, and whether a token was fetched. Optional overrides
-  // (no redeploy needed to experiment):
-  //   /diag?client=tv,web_safari  -> --extractor-args youtube:player_client=...
-  //   /diag?args=<raw>            -> --extractor-args <raw>
-  // Whichever combo prints "exit: 0" with a url is what to bake into the
-  // YTDLP_EXTRACTOR_ARGS env var.
-  if (path === '/diag') {
+  // Debug probe: /diag resolves the first track of the source (verbose),
+  // /diag?url=X resolves X, /diag?list lists the source's track permalinks.
+  if (route === '/diag') {
     const q = new URL(req.url, 'http://x').searchParams;
-    const raw = q.get('args');
-    const client = q.get('client');
-    const extractor = raw || (client ? `youtube:player_client=${client}` : EXTRACTOR_ARGS);
-    const jsr = q.has('jsruntimes') ? q.get('jsruntimes') : JS_RUNTIMES;
-    const remote = q.has('remote') ? q.get('remote') : REMOTE_COMPONENTS;
-    const useCookies = !!COOKIES && !DISABLE_COOKIES && !q.has('nocookies');
-    const target = q.get('url') || STREAM_URL;   // ?url= to test any source (e.g. a SoundCloud link)
-    const args = ['-v', '-g', '-f', 'bestaudio/best'];
-    args.push(...(q.has('url') ? ['--playlist-items', '1'] : ['--no-playlist']));
-    if (jsr) args.push('--js-runtimes', jsr);
-    if (remote) args.push('--remote-components', remote);
-    if (useCookies) args.push('--cookies', COOKIES);
-    if (extractor) args.push('--extractor-args', extractor);
-    args.push(target);
-    const provider = await probeProvider();
+    const target = q.get('url') || SOURCE_URL;
+    const args = q.has('list')
+      ? ['--flat-playlist', '--print', '%(url)s', '--playlist-end', '25', target]
+      : ['-v', '-g', '-f', 'bestaudio/best', '--playlist-items', '1', target];
     const r = await runCapture(YTDLP, args, 120000);
     const url = r.out.trim().split('\n')[0] || '(none)';
-    const head = `# yt-dlp ${ytdlpVersion}\n# target: ${target}\n# cookies-used: ${useCookies}\n# pot provider: ${provider}\n`
-      + `# js-runtimes: ${jsr || '(yt-dlp default)'}\n# remote-components: ${remote || '(none)'}\n# extractor-args: ${extractor || '(none)'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
+    const head = `# yt-dlp ${ytdlpVersion}\n# target: ${target}\n# mode: ${q.has('list') ? 'list' : 'resolve'}\n# exit: ${r.code}\n# url: ${url}\n\n`;
     res.writeHead(r.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end((head + '===== STDERR (verbose) =====\n' + r.err + '\n===== STDOUT =====\n' + r.out).slice(0, 80000));
+    return res.end((head + '===== STDOUT =====\n' + r.out + '\n===== STDERR =====\n' + r.err).slice(0, 80000));
   }
 
-  if (path === '/') {
+  if (route === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(`<!doctype html><meta charset=utf-8><title>ESM lofi relay</title>
 <body style="font:16px system-ui;background:#111;color:#eee;padding:2rem;max-width:42rem;margin:auto">
 <h1>🎧 ESM lofi relay</h1>
-<p>Always-on MP3 of the Lofi Girl live feed for the office TVs — no video, no ads.</p>
+<p>Always-on MP3 of the Lofi Girl catalogue (via SoundCloud) for the office TVs — no video, no ads.</p>
 <p>Stream URL: <code>/lofi.mp3</code></p>
 <audio controls autoplay src="/lofi.mp3"></audio>
 <p><a style="color:#8bf" href="/status">/status</a> · <a style="color:#8bf" href="/diag">/diag</a></p>`);
   }
 
-  if (path === '/lofi.mp3' || path === '/lofi') {
+  if (route === '/lofi.mp3' || route === '/lofi') {
     if (listeners.size >= MAX_LISTENERS) {
       log('rejecting listener: at MAX_LISTENERS', MAX_LISTENERS);
       res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '30' });
@@ -331,11 +266,11 @@ const server = http.createServer(async (req, res) => {
       'Content-Type': 'audio/mpeg',
       'Cache-Control': 'no-cache, no-store',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*', // TVs load this cross-origin from the Pages site
+      'Access-Control-Allow-Origin': '*',
     });
-    res.flushHeaders(); // send headers now so the TV connects without waiting for the first audio byte
+    res.flushHeaders();
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    for (const chunk of prebuffer) res.write(chunk); // instant-start burst
+    for (const chunk of prebuffer) res.write(chunk);
     listeners.add(res);
     log('listener +1 ->', listeners.size);
     startPipeline();
@@ -352,12 +287,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  log(`relay listening on :${PORT}, source ${STREAM_URL}`);
-  log('binaries -> ffmpeg:', FFMPEG, '| yt-dlp:', YTDLP, '| cookies:', COOKIES ? 'loaded' : 'none');
+  log(`relay listening on :${PORT}, source ${SOURCE_URL}`);
+  log('binaries -> ffmpeg:', FFMPEG, '| yt-dlp:', YTDLP, '| shuffle:', SHUFFLE);
   runCapture(YTDLP, ['--version'], 10000).then((r) => {
     ytdlpVersion = (r.out || '').trim() || 'unknown';
-    log('yt-dlp version:', ytdlpVersion, '| PO-token port:', POT_PORT);
+    log('yt-dlp version:', ytdlpVersion);
   });
+  loadTracks(true).catch((e) => log('initial track load failed:', String(e)));
 });
 
 process.on('uncaughtException', (e) => log('uncaughtException', e));

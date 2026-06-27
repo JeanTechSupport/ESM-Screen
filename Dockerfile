@@ -1,41 +1,26 @@
-# Base off the official bgutil PO-token provider image. It already bundles the
-# provider server (Node) plus its native deps (canvas/jsdom/BotGuard), so we
-# don't rebuild any of that or risk an ABI/lib mismatch. We add ffmpeg, yt-dlp,
-# the bgutil yt-dlp PLUGIN, and the relay on top, then run the provider and the
-# relay together in one container, wired over localhost.
+# Lofi relay — SoundCloud edition.
 #
-# Why: from a datacenter IP (Render) YouTube bot-walls yt-dlp even with cookies.
-# The provider mints the proof-of-origin (PO) tokens YouTube now demands; the
-# plugin hands them to yt-dlp automatically. Combined with the cookies secret
-# file, this gets the real Lofi Girl live stream resolving reliably.
-FROM brainicism/bgutil-ytdlp-pot-provider:latest
+# SoundCloud resolves cleanly from a datacenter IP with plain yt-dlp, so this is
+# just ffmpeg + yt-dlp + the relay. None of the YouTube anti-bot machinery is
+# needed any more (no PO-token provider, no Deno, no cookies) — which also drops
+# the memory pressure that risked OOM on the free plan.
+#
+# yt-dlp[default] pulls curl_cffi for SoundCloud's impersonation. The ADD busts
+# the pip layer whenever a new yt-dlp release ships, so a normal redeploy pulls
+# the current version (force a clean rebuild with "Clear build cache & deploy").
+FROM node:20-bookworm-slim
 
-USER root
-
-# ffmpeg: the audio transcode. python3/pip: yt-dlp + the bgutil PO-token plugin
-# (client side), via pip so yt-dlp auto-discovers the plugin. tini: reap the
-# provider's child processes (we run two processes in one container).
-# The ADD busts the pip layer whenever a new yt-dlp release ships, so a normal
-# redeploy pulls the current yt-dlp; "Clear build cache & deploy" forces it.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates tini \
+ && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
 ADD https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest /tmp/ytdlp-release.json
-RUN pip3 install --no-cache-dir --break-system-packages -U \
-      yt-dlp bgutil-ytdlp-pot-provider
+RUN pip3 install --no-cache-dir --break-system-packages -U "yt-dlp[default]"
 
-# yt-dlp 2026+ needs a JS runtime to solve YouTube's player JS challenge; without
-# one it falls back to JS-free clients (android_vr) that just return
-# LOGIN_REQUIRED, so the bot wall never lifts. Deno is the runtime yt-dlp enables
-# by default — drop the static binary onto PATH and yt-dlp picks it up.
-COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+WORKDIR /app
+COPY package.json server.js ./
 
-# The relay itself.
-WORKDIR /relay
-COPY package.json server.js start.sh ./
-RUN chmod +x start.sh
-
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    STREAM_URL=https://soundcloud.com/lofi_girl
 EXPOSE 10000
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/relay/start.sh"]
+CMD ["node", "server.js"]

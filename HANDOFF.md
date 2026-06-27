@@ -1,9 +1,29 @@
 # Lofi relay — handoff / status doc
 
-> Living doc for whoever picks this up next. Goal: play the **Lofi Girl YouTube
-> live** stream as background audio on the office TVs, reliably, from a cloud
-> server. We're deep in beating YouTube's datacenter-IP bot detection.
-> Last updated mid-session after adding diagnostics (not yet deployed/tested).
+> Living doc for whoever picks this up next. Goal: play Lofi Girl as background
+> audio on the office TVs, reliably, from a cloud server.
+
+---
+
+## 0. ✅ RESOLUTION — switched to SoundCloud
+
+**YouTube from a datacenter IP is a dead end** (proven exhaustively below: even
+with the PO-token provider + Deno + EJS solver all working, every client returns
+`LOGIN_REQUIRED`, and the only thing that passes — account cookies — Google
+invalidates within hours). 
+
+**The fix: stream Lofi Girl's catalogue from SoundCloud instead.** SoundCloud
+resolves cleanly from Render with plain yt-dlp (verified: `/diag?url=https://soundcloud.com/lofi_girl`
+→ `exit: 0` with a media URL — no cookies/tokens/JS runtime). The relay was
+rewritten to flat-list the SoundCloud source into track permalinks, shuffle, and
+resolve + transcode them on a loop. The whole YouTube anti-bot stack (bgutil
+provider, Deno, cookies, PO tokens, `start.sh`, tini) was **removed** — smaller
+image, no OOM risk, no secrets.
+
+Sections 1–9 below are the historical YouTube investigation, kept for context.
+The current design is documented in `README.md`. Key env: `STREAM_URL`
+(SoundCloud URL), `SHUFFLE`, `MAX_TRACKS`, `RELIST_MS`. Debug via `/diag`
+(`?url=` any source, `?list` to flat-list) and `/status` (track count/index).
 
 ---
 
